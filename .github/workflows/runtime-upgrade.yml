@@ -8,9 +8,10 @@ on:
 permissions: read-all
 
 env:
-  RUNNER_VM_NAME: "github-runner-$GITHUB_RUN_ID-attempt-$GITHUB_RUN_ATTEMPT"
-  RESOURCE_GROUP: "github-runner-$GITHUB_RUN_ID-attempt-$GITHUB_RUN_ATTEMPT"
-  AZ_LOCATION: "westus3"
+  RUNNER_VM_NAME: "${{ github.event.repository.name }}-$GITHUB_RUN_ID-attempt-$GITHUB_RUN_ATTEMPT"
+  LINODE_REGION: "us-ord"
+  # Shared CPU, Linode 32 GB, 8 vCPU, disk: 640 GB, 0.288 $/hr
+  LINODE_VM_SIZE: "g6-standard-8"
 
 jobs:
   setup:
@@ -146,7 +147,7 @@ jobs:
       - setup
       - deploy-github-runner
     runs-on:
-      [self-hosted, "${{ needs.deploy-github-runner.outputs.runner_vm_name }}"]
+      [self-hosted, "workflow-${{ github.run_id }}", "type-runtime-upgrade"]
 
     steps:
       - name: Grant everyone permissions on /mnt
@@ -160,7 +161,7 @@ jobs:
       - live-sync-creditcoin
       - deploy-github-runner
     runs-on:
-      [self-hosted, "${{ needs.deploy-github-runner.outputs.runner_vm_name }}"]
+      [self-hosted, "workflow-${{ github.run_id }}", "type-runtime-upgrade"]
 
     steps:
       - uses: actions/checkout@v4
@@ -247,7 +248,7 @@ jobs:
       - setup-self-hosted
       - deploy-github-runner
     runs-on:
-      [self-hosted, "${{ needs.deploy-github-runner.outputs.runner_vm_name }}"]
+      [self-hosted, "workflow-${{ github.run_id }}", "type-runtime-upgrade"]
 
     steps:
       - uses: actions/checkout@v4
@@ -314,7 +315,8 @@ jobs:
       - fork-creditcoin
       - deploy-github-runner
     runs-on:
-      [self-hosted, "${{ needs.deploy-github-runner.outputs.runner_vm_name }}"]
+      [self-hosted, "workflow-${{ github.run_id }}", "type-runtime-upgrade"]
+
     steps:
       - uses: actions/checkout@v4
 
@@ -430,7 +432,8 @@ jobs:
       - live-sync-creditcoin
       - deploy-github-runner
     runs-on:
-      [self-hosted, "${{ needs.deploy-github-runner.outputs.runner_vm_name }}"]
+      [self-hosted, "workflow-${{ github.run_id }}", "type-runtime-upgrade"]
+
     steps:
       - uses: actions/checkout@v4
 
@@ -544,77 +547,50 @@ jobs:
           killall -9 creditcoin-node
 
   deploy-github-runner:
-    runs-on: ubuntu-22.04
-    outputs:
-      runner_vm_name: ${{ steps.get-env.outputs.runner_vm_name }}
-      resource_group: ${{ steps.get-env.outputs.resource_group }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - proxy_type: runtime-upgrade
 
+    name: deploy-github-runner / type=${{ matrix.proxy_type }}
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install azure-cli
+      # See https://github.com/actions/runner/issues/1879#issuecomment-1123196869
+      - name: Create matrix.txt
         run: |
-          sudo apt remove azure-cli -y && sudo apt autoremove -y
-          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-          sudo apt install -y jq
-          az version
-
-      - name: Authorize hosted-runner
-        run: |
-          mkdir -p ~/.ssh/
-          ssh-keygen -q -t rsa -N '' -f ~/.ssh/id_rsa
-          cat ~/.ssh/id_rsa.pub >> .github/authorized_keys
+          echo "proxy=type=${{ matrix.proxy_type }}" > matrix.txt
 
       - name: Evaluate env vars
         id: get-env
         run: |
+          HASH_VALUE=$(echo "${{ hashFiles('matrix.txt') }}" | cut -c1-7)
+          rm matrix.txt
+
           # WARNING: using env.RUNNER_VM_NAME directly in job outputs above
           # doesn't evaluate the $GITHUB_RUN_ID reference
-          echo "runner_vm_name=${{ env.RUNNER_VM_NAME }}" >> "$GITHUB_OUTPUT"
-          echo "resource_group=${{ env.RESOURCE_GROUP }}" >> "$GITHUB_OUTPUT"
+          echo "runner_vm_name=${{ env.RUNNER_VM_NAME }}-$HASH_VALUE" >> "$GITHUB_OUTPUT"
 
       - name: Provision VM
         if: env.LC_GITHUB_REPO_ADMIN_TOKEN
         run: |
-          echo "INFO: From ENVs: RUNNER_VM_NAME=${{ env.RUNNER_VM_NAME }}"
-          echo "INFO: From Step: RUNNER_VM_NAME=${{ steps.get-env.outputs.runner_vm_name }}"
-
-          az login --service-principal --username "${{ secrets.AZURE_APP_ID }}" --password "${{ secrets.AZURE_APP_PASSWORD }}" --tenant "${{ secrets.AZURE_TENANT_ID }}"
-          az account set --subscription "Playground Subscription"
-          ## az account set -s "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
-
-
-          # create resource group
-          echo "INFO: ${{ steps.get-env.outputs.resource_group }}"
-          az group create -n "${{ steps.get-env.outputs.resource_group }}" --location "${{ env.AZ_LOCATION }}"
-
-          # RG Creditcoin-Test is in WestUS and the CPU quota is already full
-          # that's why specify a different region here
-          az deployment group create -g "${{ steps.get-env.outputs.resource_group }}" -f .github/runner.bicep \
-              --parameters location="${{ env.AZ_LOCATION }}" \
-              --parameters vmName="${{ steps.get-env.outputs.runner_vm_name }}" \
-              --parameters adminPasswordOrKey="$(cat .github/authorized_keys)" > output.json
-
-          # provision the GitHub Runner binary on the VM
-          # passing additional ENV values
-          SSH_USER_AT_HOSTNAME=$(jq -r '.properties.outputs.sshUserAtHostname.value' < output.json)
-          echo "INFO: $SSH_USER_AT_HOSTNAME"
-
-          export LC_RUNNER_VM_NAME="${{ env.RUNNER_VM_NAME }}"
-          until ssh -i ~/.ssh/id_rsa \
-              -o SendEnv=LC_GITHUB_REPO_ADMIN_TOKEN,LC_RUNNER_VM_NAME \
-              -o StrictHostKeyChecking=no "$SSH_USER_AT_HOSTNAME" < ./scripts/provision-github-runner.sh; do
-            echo "DEBUG: retrying ssh connection ..."
-            sleep 30
-          done
+          .github/provision-linode-vm.sh
         env:
+          LC_OWNER_REPO_SLUG: ${{ github.repository }}
           LC_GITHUB_REPO_ADMIN_TOKEN: ${{ secrets.GH_REPO_ADMIN_TOKEN }}
           LC_RUNNER_EPHEMERAL: false
+          LC_RUNNER_VM_NAME: ${{ steps.get-env.outputs.runner_vm_name }}
+          LC_PROXY_TYPE: ${{ matrix.proxy_type }}
+          LC_WORKFLOW_ID: ${{ github.run_id }}
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
 
   test-migrations-via-try-runtime:
     # see https://gist.github.com/jonico/a94d03cac7a858e0613926d9f1bc7f2b
     runs-on:
-      [self-hosted, "${{ needs.deploy-github-runner.outputs.runner_vm_name }}"]
+      [self-hosted, "workflow-${{ github.run_id }}", "type-runtime-upgrade"]
     needs:
       - build-sut
       - setup
@@ -706,35 +682,34 @@ jobs:
       - test-migrations-via-try-runtime
       - test-against-fork
       - test-against-disconnected-live-node
-    if: ${{ always() && needs.deploy-github-runner.result != 'skipped' }}
+    if: ${{ always() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - proxy_type: runtime-upgrade
+
+    name: remove-github-runner / type=${{ matrix.proxy_type }}
 
     steps:
       - uses: actions/checkout@v4
 
+      # See https://github.com/actions/runner/issues/1879#issuecomment-1123196869
+      - name: Create matrix.txt
+        run: |
+          echo "proxy=type=${{ matrix.proxy_type }}" > matrix.txt
+
       - name: Evaluate env vars
         id: get-env
         run: |
-          # WARNING: using env.RUNNER_VM_NAME directly in job outputs above
-          # doesn't evaluate the $GITHUB_RUN_ID reference
-          echo "resource_group=${{ env.RESOURCE_GROUP }}" >> "$GITHUB_OUTPUT"
+          HASH_VALUE=$(echo "${{ hashFiles('matrix.txt') }}" | cut -c1-7)
+          rm matrix.txt
 
-      - name: Install azure-cli
-        run: |
-          sudo apt remove azure-cli -y && sudo apt autoremove -y
-          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-          az version
+          echo "runner_vm_name=${{ env.RUNNER_VM_NAME }}-$HASH_VALUE" >> "$GITHUB_OUTPUT"
 
       - name: Remove VM
         run: |
-          echo "INFO: RUNNER_VM_NAME=${{ env.RUNNER_VM_NAME }}"
-
-          az login --service-principal --username "${{ secrets.AZURE_APP_ID }}" --password "${{ secrets.AZURE_APP_PASSWORD }}" --tenant "${{ secrets.AZURE_TENANT_ID }}"
-          az account set --subscription "Playground Subscription"
-          az group delete --yes -n "${{ steps.get-env.outputs.resource_group }}"
-
-      - name: Upload logs
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: "Azure resources"
-          path: azure_resource_list.json
+          .github/remove-linode-vm.sh
+        env:
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
+          LC_RUNNER_VM_NAME: ${{ steps.get-env.outputs.runner_vm_name }}
