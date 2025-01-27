@@ -23,6 +23,7 @@ jobs:
       rpc_url: ${{ steps.testnet-env.outputs.rpc_url || steps.mainnet-env.outputs.rpc_url }}
       https_rpc_url: ${{ steps.testnet-env.outputs.https_rpc_url || steps.mainnet-env.outputs.https_rpc_url }}
       release_tag: ${{ steps.testnet-env.outputs.release_tag || steps.mainnet-env.outputs.release_tag }}
+      snapshot_container: ${{ steps.testnet-env.outputs.snapshot_container || steps.mainnet-env.outputs.snapshot_container }}
       artifact_name: ${{ steps.testnet-env.outputs.artifact_name || steps.mainnet-env.outputs.artifact_name }}
       last_block_hash: ${{ steps.last-block-info.outputs.last_block_hash }}
       last_block_number: ${{ steps.last-block-info.outputs.last_block_number }}
@@ -47,6 +48,7 @@ jobs:
           echo "https_rpc_url=https://rpc.testnet.creditcoin.network/rpc" >> "$GITHUB_OUTPUT"
           RELEASE_TAG=$(./scripts/extract-release-tag.sh "testnet")
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "snapshot_container=cc-testnet" >> "$GITHUB_OUTPUT"
           echo "artifact_name=creditcoin-$RELEASE_TAG-$(uname -m)-unknown-linux-gnu.zip" >> "$GITHUB_OUTPUT"
 
       - name: Mainnet ENV
@@ -61,6 +63,7 @@ jobs:
           echo "https_rpc_url=https://rpc.mainnet.creditcoin.network/rpc" >> "$GITHUB_OUTPUT"
           RELEASE_TAG=$(./scripts/extract-release-tag.sh "mainnet")
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "snapshot_container=cc-mainnet" >> "$GITHUB_OUTPUT"
           echo "artifact_name=creditcoin-$RELEASE_TAG-$(uname -m)-unknown-linux-gnu.zip" >> "$GITHUB_OUTPUT"
 
       - name: Store last block info
@@ -201,7 +204,7 @@ jobs:
             --bootnodes "${{ needs.setup.outputs.boot_node }}" \
             --prometheus-external \
             --telemetry-url "wss://telemetry.creditcoin.network/submit/ 0" \
-            --base-path /mnt \
+            --base-path /mnt/data \
             --public-addr "/dns4/$IP_ADDRESS/tcp/50555" \
             --port 50555 >creditcoin-node-used-for-fork.log 2>&1 &
 
@@ -253,6 +256,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install azure-cli
+        run: |
+          sudo apt remove azure-cli -y && sudo apt autoremove -y
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          sudo apt install -y jq unzip
+          az version
+
+      - name: Download latest chain snapshot for ${{ needs.setup.outputs.snapshot_container }}
+        working-directory: /mnt
+        run: |
+          df -h
+
+          az login --service-principal --username "${{ secrets.AZURE_APP_ID }}" --password "${{ secrets.AZURE_APP_PASSWORD }}" --tenant "${{ secrets.AZURE_TENANT_ID }}"
+          az account set --subscription "Prod Subscription"
+
+          LATEST_SNAPSHOT=$(az storage blob list --auth-mode=login --account-name=snapshotexportaccount --container-name=${{ needs.setup.outputs.snapshot_container }} | jq -r ".[].name" | tail -n1)
+          echo "INFO: latest snapshot=$LATEST_SNAPSHOT"
+
+          az storage blob download --auth-mode=login --account-name=snapshotexportaccount --container-name=${{ needs.setup.outputs.snapshot_container }} --name "$LATEST_SNAPSHOT" --file ./snapshot.zip
+
+          ls -lh ./snapshot.zip
+          unzip ./snapshot.zip && rm ./snapshot.zip
+
+          df -h
+
       - name: Download creditcoin-node for release ${{ needs.setup.outputs.release_tag }}
         uses: i3h/download-release-asset@v1
         with:
@@ -281,7 +309,7 @@ jobs:
             --prometheus-external --pruning archive \
             --telemetry-url "wss://telemetry.creditcoin.network/submit/ 0" \
             --public-addr "/dns4/$IP_ADDRESS/tcp/50555" \
-            --base-path /mnt \
+            --base-path /mnt/data \
             --port 50555 >creditcoin-node-initial-live-sync.log 2>&1 &
 
       - name: Wait for creditcoin-node to sync past block number ${{ needs.setup.outputs.last_block_number }}
@@ -337,7 +365,7 @@ jobs:
 
           ./target/release/creditcoin-node --version
           ./target/release/creditcoin-node --chain ./creditcoin-fork.json --validator --alice --pruning archive \
-                            --base-path /mnt \
+                            --base-path /mnt/fork-data \
                             --monitor-nonce auto >creditcoin-node-with-forked-chain.log 2>&1 &
 
       - name: Wait for blockchain to start
@@ -457,7 +485,7 @@ jobs:
             --validator --alice --pruning archive \
             --prometheus-external \
             --telemetry-url "wss://telemetry.creditcoin.network/submit/ 0" \
-            --base-path /mnt \
+            --base-path /mnt/data \
             --monitor-nonce auto >creditcoin-node-disconnected-live-node.log 2>&1 &
 
       - name: Wait for blockchain to start
@@ -639,7 +667,7 @@ jobs:
             --rpc-max-response-size 200000 \
             --prometheus-external --pruning archive \
             --telemetry-url "wss://telemetry.creditcoin.network/submit/ 0" \
-            --base-path /mnt \
+            --base-path /mnt/data \
             --public-addr "/dns4/$IP_ADDRESS/tcp/30333" >creditcoin-node-used-for-try-runtime.log 2>&1 &
 
       - name: Wait for creditcoin-node to initialize
