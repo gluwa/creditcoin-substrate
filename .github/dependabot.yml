@@ -130,3 +130,14 @@ updates:
     ignore:
       - dependency-name: "*"
         update-types: ["version-update:semver-patch"]
+
+  # Python dependencies for Linode
+  - package-ecosystem: "pip"
+    directories:
+      - "/.github"
+    groups:
+      linode-dependencies:
+        dependency-type: "production"
+        applies-to: version-updates
+    schedule:
+      interval: "monthly"
